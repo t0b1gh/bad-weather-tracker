@@ -57,17 +57,20 @@ async function fetchWeather(city, range) {
   return out;
 }
 
+// Values are rounded to the 0.1 precision shown in the UI, so a day displayed as exactly 5.0h counts as meeting a 5h threshold
+const r1 = x => x == null ? x : Math.round(x * 10) / 10;
+
 function classify(d, i, sl) {
-  const sun = (d.sunshine_duration?.[i] ?? 0) / 3600;
-  const day = (d.daylight_duration?.[i] ?? 0) / 3600;
-  const temp = d.temperature_2m_max?.[i];
-  const rain = d.precipitation_hours?.[i] ?? 0;
+  const sun = r1((d.sunshine_duration?.[i] ?? 0) / 3600);
+  const day = r1((d.daylight_duration?.[i] ?? 0) / 3600);
+  const temp = r1(d.temperature_2m_max?.[i]);
+  const rain = r1(d.precipitation_hours?.[i] ?? 0);
   if (temp == null) return null;
   return sun >= sl.minSun && day >= sl.minDay && temp >= sl.minTemp && temp <= sl.maxTemp && rain <= sl.maxRain;
 }
 
 // groups: arrays of day indices (one per year)
-// Colour of a day; a day failing several conditions gets the first of these that applies
+// Colour of a day; a day failing several conditions gets the first of these that applies (rain, cold, sun, daylight, hot)
 const REASONS = {
   good: { color: "#22c55e", label: "Good day" },
   hot: { color: "#ef4444", label: "Bad day — too hot" },
@@ -78,13 +81,13 @@ const REASONS = {
 };
 
 function dayReason(d, i, sl) {
-  const temp = d.temperature_2m_max?.[i];
+  const temp = r1(d.temperature_2m_max?.[i]);
   if (temp == null) return null;
-  if (temp > sl.maxTemp) return "hot";
+  if (r1(d.precipitation_hours?.[i] ?? 0) > sl.maxRain) return "rain";
   if (temp < sl.minTemp) return "cold";
-  if ((d.precipitation_hours?.[i] ?? 0) > sl.maxRain) return "rain";
-  if ((d.sunshine_duration?.[i] ?? 0) / 3600 < sl.minSun) return "sun";
-  if ((d.daylight_duration?.[i] ?? 0) / 3600 < sl.minDay) return "daylight";
+  if (r1((d.sunshine_duration?.[i] ?? 0) / 3600) < sl.minSun) return "sun";
+  if (r1((d.daylight_duration?.[i] ?? 0) / 3600) < sl.minDay) return "daylight";
+  if (temp > sl.maxTemp) return "hot";
   return "good";
 }
 
@@ -101,10 +104,10 @@ function getStats(d, sl, groups) {
       mo[m].t++;
       if (g) { good++; mo[m].g++; }
       else {
-        const sun = (d.sunshine_duration?.[i] ?? 0) / 3600;
-        const day = (d.daylight_duration?.[i] ?? 0) / 3600;
-        const temp = d.temperature_2m_max?.[i];
-        const rain = d.precipitation_hours?.[i] ?? 0;
+        const sun = r1((d.sunshine_duration?.[i] ?? 0) / 3600);
+        const day = r1((d.daylight_duration?.[i] ?? 0) / 3600);
+        const temp = r1(d.temperature_2m_max?.[i]);
+        const rain = r1(d.precipitation_hours?.[i] ?? 0);
         if (sun < sl.minSun) failSun++;
         if (day < sl.minDay) failDay++;
         if (temp != null && temp < sl.minTemp) failMinTemp++;
@@ -391,7 +394,7 @@ export default function DayQualityTracker() {
   const add = (r) => {
     const city = { name: `${r.name}, ${r.country || ""}`.replace(/, $/, ""), lat: r.latitude, lon: r.longitude };
     if (!cities.some(c => ckey(c) === ckey(city))) {
-      setCities(p => [...p, city]);
+      setCities(p => [city, ...p]);
       load(city);
     }
     setQuery(""); setResults([]); setShowDropdown(false);
