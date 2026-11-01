@@ -17,32 +17,44 @@ const SLIDER_DEFS = [
   { key: "maxRain", label: "Max rain hours", unit: "h", min: 0, max: 12, step: 0.5, color: "#818cf8" },
 ];
 
+const CUR_YEAR = new Date().getFullYear();
+const YEARS = Array.from({ length: 5 }, (_, i) => CUR_YEAR - i);
+const CUM = [0, 31, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335]; // leap-year layout so years align
+const DIM = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+const MONTH_NAMES = ["January","February","March","April","May","June","July","August","September","October","November","December"];
+
 function getRange() {
   const e = new Date(); e.setDate(e.getDate() - 1);
-  const s = new Date(e); s.setFullYear(s.getFullYear() - 1); s.setDate(s.getDate() + 1);
-  return { start: fmt(s), end: fmt(e) };
+  return { start: `${CUR_YEAR - 4}-01-01`, end: fmt(e) };
 }
 
 const ckey = c => `${c.lat.toFixed(2)}_${c.lon.toFixed(2)}`;
 
+const DAILY = "sunshine_duration,daylight_duration,temperature_2m_max,precipitation_hours";
+const dayShift = (iso, n) => { const d = new Date(iso + "T00:00:00Z"); d.setUTCDate(d.getUTCDate() + n); return fmt(d); };
+
+async function fetchDaily(base, city, start, end) {
+  const res = await fetch(`${base}?latitude=${city.lat}&longitude=${city.lon}&start_date=${start}&end_date=${end}&daily=${DAILY}&timezone=auto`);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const json = await res.json();
+  if (json.error) throw new Error(json.reason || "API error");
+  if (!(json.daily?.time?.length > 0)) throw new Error("No data returned");
+  return json.daily;
+}
+
+// Archive API covers everything up to ~a week ago; the forecast API fills in the most recent days.
 async function fetchWeather(city, range) {
-  // Try main forecast API first (supports historical via start/end dates), fallback to archive API
-  const endpoints = [
-    `https://api.open-meteo.com/v1/forecast?latitude=${city.lat}&longitude=${city.lon}&start_date=${range.start}&end_date=${range.end}&daily=sunshine_duration,daylight_duration,temperature_2m_max,precipitation_hours&timezone=auto`,
-    `https://archive-api.open-meteo.com/v1/archive?latitude=${city.lat}&longitude=${city.lon}&start_date=${range.start}&end_date=${range.end}&daily=sunshine_duration,daylight_duration,temperature_2m_max,precipitation_hours&timezone=auto`,
-  ];
-  let lastErr;
-  for (const url of endpoints) {
-    try {
-      const res = await fetch(url);
-      if (!res.ok) { lastErr = new Error(`HTTP ${res.status}`); continue; }
-      const json = await res.json();
-      if (json.error) { lastErr = new Error(json.reason || "API error"); continue; }
-      if (json.daily?.time?.length > 0) return json.daily;
-      lastErr = new Error("No data returned");
-    } catch (e) { lastErr = e; }
-  }
-  throw lastErr || new Error("All endpoints failed");
+  const split = dayShift(range.end, -7);
+  if (split < range.start) return fetchDaily("https://api.open-meteo.com/v1/forecast", city, range.start, range.end);
+  const [old, recent] = await Promise.allSettled([
+    fetchDaily("https://archive-api.open-meteo.com/v1/archive", city, range.start, split),
+    fetchDaily("https://api.open-meteo.com/v1/forecast", city, dayShift(split, 1), range.end),
+  ]);
+  if (old.status === "rejected") throw old.reason;
+  if (recent.status === "rejected") return old.value;
+  const out = {};
+  for (const k of Object.keys(old.value)) out[k] = [...old.value[k], ...(recent.value[k] ?? [])];
+  return out;
 }
 
 function classify(d, i, sl) {
@@ -54,33 +66,49 @@ function classify(d, i, sl) {
   return sun >= sl.minSun && day >= sl.minDay && temp >= sl.minTemp && temp <= sl.maxTemp && rain <= sl.maxRain;
 }
 
-function getStats(d, sl) {
-  if (!d?.time) return null;
-  let good = 0, bs = 0, mbs = 0, gs = 0, mgs = 0;
+// groups: arrays of day indices (one per year); streaks do not span groups
+function getStats(d, sl, groups) {
+  let good = 0, total = 0, bs = 0, mbs = 0, gs = 0, mgs = 0;
   let failSun = 0, failDay = 0, failMinTemp = 0, failMaxTemp = 0, failRain = 0;
   const mo = {};
-  for (let i = 0; i < d.time.length; i++) {
-    const g = classify(d, i, sl);
-    const m = d.time[i].slice(0, 7);
-    if (!mo[m]) mo[m] = { g: 0, t: 0 };
-    mo[m].t++;
-    if (g) { good++; mo[m].g++; gs++; mgs = Math.max(mgs, gs); bs = 0; }
-    else {
-      bs++; mbs = Math.max(mbs, bs); gs = 0;
-      const sun = (d.sunshine_duration?.[i] ?? 0) / 3600;
-      const day = (d.daylight_duration?.[i] ?? 0) / 3600;
-      const temp = d.temperature_2m_max?.[i];
-      const rain = d.precipitation_hours?.[i] ?? 0;
-      if (sun < sl.minSun) failSun++;
-      if (day < sl.minDay) failDay++;
-      if (temp != null && temp < sl.minTemp) failMinTemp++;
-      if (temp != null && temp > sl.maxTemp) failMaxTemp++;
-      if (rain > sl.maxRain) failRain++;
+  for (const idx of groups) {
+    bs = 0; gs = 0;
+    for (const i of idx) {
+      total++;
+      const g = classify(d, i, sl);
+      const m = +d.time[i].slice(5, 7) - 1;
+      if (!mo[m]) mo[m] = { g: 0, t: 0 };
+      mo[m].t++;
+      if (g) { good++; mo[m].g++; gs++; mgs = Math.max(mgs, gs); bs = 0; }
+      else {
+        bs++; mbs = Math.max(mbs, bs); gs = 0;
+        const sun = (d.sunshine_duration?.[i] ?? 0) / 3600;
+        const day = (d.daylight_duration?.[i] ?? 0) / 3600;
+        const temp = d.temperature_2m_max?.[i];
+        const rain = d.precipitation_hours?.[i] ?? 0;
+        if (sun < sl.minSun) failSun++;
+        if (day < sl.minDay) failDay++;
+        if (temp != null && temp < sl.minTemp) failMinTemp++;
+        if (temp != null && temp > sl.maxTemp) failMaxTemp++;
+        if (rain > sl.maxRain) failRain++;
+      }
     }
   }
-  return { good, total: d.time.length, maxBad: mbs, maxGood: mgs, monthly: mo,
+  return { good, total, maxBad: mbs, maxGood: mgs, monthly: mo,
     failSun, failDay, failMinTemp, failMaxTemp, failRain };
 }
+
+function yearIndices(d, year, m0, m1) {
+  const out = [], prefix = `${year}-`;
+  for (let i = 0; i < d.time.length; i++) {
+    if (!d.time[i].startsWith(prefix)) continue;
+    const m = +d.time[i].slice(5, 7) - 1;
+    if (m >= m0 && m <= m1) out.push(i);
+  }
+  return out;
+}
+
+const slotOf = (t, m0) => CUM[+t.slice(5, 7) - 1] + +t.slice(8, 10) - 1 - CUM[m0];
 
 function Slider({ def, value, onChange }) {
   const pct = ((value - def.min) / (def.max - def.min)) * 100;
@@ -110,87 +138,107 @@ function Slider({ def, value, onChange }) {
   );
 }
 
-function DotStrip({ data, sliders }) {
-  const [hov, setHov] = useState(null);
-  const ref = useRef();
-  const n = data.time.length;
+const UNIT = 2.8;
+const ROW_H = 18;
+const ROW_GAP = 4;
+const LABEL_W = 44;
 
-  const months = useMemo(() => {
-    const m = []; let c = "";
-    data.time.forEach((t, i) => {
-      const mo = t.slice(0, 7);
-      if (mo !== c) { m.push({ label: MO[parseInt(t.slice(5, 7)) - 1], idx: i, key: mo }); c = mo; }
-    });
-    return m;
-  }, [data.time]);
+// rows: [{ label, cells: [{ slot, i?, g, frac?, yes?, n? }], avg? }]
+function Strips({ data, sliders, rows, m0, m1 }) {
+  const [hov, setHov] = useState(null); // { row, cell }
+  const n = CUM[m1] + DIM[m1] - CUM[m0];
+  const w = n * UNIT;
+  const labelH = 14;
 
-  const unit = 2.8;
-  const w = n * unit;
-  const dotH = 18;
-  const labelH = 28;
-  const totalH = dotH + labelH;
-
-  const hovData = hov !== null ? {
-    date: data.time[hov],
-    sun: ((data.sunshine_duration?.[hov] ?? 0) / 3600).toFixed(1),
-    day: ((data.daylight_duration?.[hov] ?? 0) / 3600).toFixed(1),
-    temp: data.temperature_2m_max?.[hov]?.toFixed(1) ?? "—",
-    rain: (data.precipitation_hours?.[hov] ?? 0).toFixed(1),
-    good: classify(data, hov, sliders),
-  } : null;
+  let tip = null;
+  if (hov) {
+    const row = rows[hov.row], c = hov.cell;
+    if (row.avg) {
+      tip = { avg: c };
+    } else {
+      tip = {
+        date: data.time[c.i],
+        sun: ((data.sunshine_duration?.[c.i] ?? 0) / 3600).toFixed(1),
+        day: ((data.daylight_duration?.[c.i] ?? 0) / 3600).toFixed(1),
+        temp: data.temperature_2m_max?.[c.i]?.toFixed(1) ?? "—",
+        rain: (data.precipitation_hours?.[c.i] ?? 0).toFixed(1),
+        good: c.g,
+      };
+    }
+  }
 
   return (
     <div style={{ position: "relative" }}>
-      <div ref={ref} style={{ overflowX: "auto", overflowY: "hidden", paddingBottom: 2 }}>
-        <svg viewBox={`0 0 ${w} ${totalH}`}
-          style={{ width: "100%", minWidth: 680, display: "block" }}>
-          {data.time.map((t, i) => {
-            const g = classify(data, i, sliders);
-            const x = i * unit;
-            const bw = unit - 0.4;
-            const isHov = hov === i;
-            return (
-              <g key={t}>
-                <rect x={x} y={0} width={bw} height={dotH} rx={0.4}
-                  fill={g === null ? "#334155" : g ? "#22c55e" : "none"}
-                  stroke={g === null ? "none" : g ? (isHov ? "#86efac" : "#22c55e") : "#ef4444"}
-                  strokeWidth={g ? 0 : 0.35}
-                  opacity={g === null ? 0.3 : g ? (isHov ? 1 : 0.85) : (isHov ? 0.9 : 0.5)}
-                />
-                <rect x={x} y={0} width={bw} height={dotH}
-                  fill="transparent"
-                  onMouseEnter={() => setHov(i)}
-                  onMouseLeave={() => setHov(null)}
-                  style={{ cursor: "crosshair" }}
-                />
-              </g>
-            );
-          })}
-          {months.map(({ label, idx }) => (
-            <text key={idx} x={idx * unit + 1} y={totalH - 4} fontSize="9" fill="#64748b"
-              style={{ fontFamily: "system-ui", userSelect: "none" }}>
-              {label}
-            </text>
+      <div style={{ overflowX: "auto", overflowY: "hidden", paddingBottom: 2 }}>
+        <div style={{ minWidth: LABEL_W + 6 + n * 1.86 }}>
+          {rows.map((row, ri) => (
+            <div key={row.label} style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: ROW_GAP }}>
+              <span style={{ width: LABEL_W, fontSize: 10, color: "#64748b", fontFamily: "'JetBrains Mono', monospace", flexShrink: 0 }}>{row.label}</span>
+              <svg viewBox={`0 0 ${w} ${ROW_H}`} style={{ flex: 1, display: "block", minWidth: 0 }}>
+                {row.cells.map(c => {
+                  const x = c.slot * UNIT, bw = UNIT - 0.4;
+                  const isHov = hov?.row === ri && hov.cell === c;
+                  return (
+                    <g key={c.slot}>
+                      {row.avg ? (
+                        <rect x={x} y={0} width={bw} height={ROW_H} rx={0.4}
+                          fill="#22c55e" fillOpacity={0.12 + 0.88 * c.frac}
+                          stroke="#ef4444" strokeWidth={0.35} strokeOpacity={(1 - c.frac) * 0.6}
+                          opacity={isHov ? 1 : 0.85} />
+                      ) : (
+                        <rect x={x} y={0} width={bw} height={ROW_H} rx={0.4}
+                          fill={c.g === null ? "#334155" : c.g ? "#22c55e" : "none"}
+                          stroke={c.g === null ? "none" : c.g ? (isHov ? "#86efac" : "#22c55e") : "#ef4444"}
+                          strokeWidth={c.g ? 0 : 0.35}
+                          opacity={c.g === null ? 0.3 : c.g ? (isHov ? 1 : 0.85) : (isHov ? 0.9 : 0.5)} />
+                      )}
+                      <rect x={x} y={0} width={bw} height={ROW_H} fill="transparent"
+                        onMouseEnter={() => setHov({ row: ri, cell: c })}
+                        onMouseLeave={() => setHov(null)}
+                        style={{ cursor: "crosshair" }} />
+                    </g>
+                  );
+                })}
+              </svg>
+            </div>
           ))}
-        </svg>
+          <div style={{ display: "flex", gap: 6 }}>
+            <span style={{ width: LABEL_W, flexShrink: 0 }} />
+            <svg viewBox={`0 0 ${w} ${labelH}`} style={{ flex: 1, display: "block", minWidth: 0 }}>
+              {Array.from({ length: m1 - m0 + 1 }, (_, k) => m0 + k).map(m => (
+                <text key={m} x={(CUM[m] - CUM[m0]) * UNIT + 1} y={labelH - 3} fontSize="9" fill="#64748b"
+                  style={{ fontFamily: "system-ui", userSelect: "none" }}>{MO[m]}</text>
+              ))}
+            </svg>
+          </div>
+        </div>
       </div>
-      {hovData && (
+      {tip && (
         <div style={{
-          position: "absolute", top: -72, left: "50%", transform: "translateX(-50%)",
+          position: "absolute", top: hov.row * (ROW_H + ROW_GAP) - 72, left: "50%", transform: "translateX(-50%)",
           background: "#0f172a", border: "1px solid #334155", borderRadius: 8,
           padding: "8px 12px", fontSize: 11, color: "#cbd5e1",
           pointerEvents: "none", zIndex: 20, whiteSpace: "nowrap",
           boxShadow: "0 8px 24px rgba(0,0,0,0.5)",
         }}>
-          <div style={{ fontWeight: 700, marginBottom: 4, color: hovData.good ? "#22c55e" : "#ef4444" }}>
-            {hovData.date} — {hovData.good === null ? "No data" : hovData.good ? "Good day" : "Bad day"}
-          </div>
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "2px 14px", fontVariantNumeric: "tabular-nums" }}>
-            <span style={{ color: +hovData.sun < sliders.minSun ? "#ef4444" : "#cbd5e1" }}>☀ Sun: {hovData.sun}h</span>
-            <span style={{ color: +hovData.temp > sliders.maxTemp ? "#ef4444" : +hovData.temp < sliders.minTemp ? "#ef4444" : "#cbd5e1" }}>🌡 High: {hovData.temp}°C</span>
-            <span style={{ color: +hovData.day < sliders.minDay ? "#ef4444" : "#cbd5e1" }}>◑ Daylight: {hovData.day}h</span>
-            <span style={{ color: +hovData.rain > sliders.maxRain ? "#ef4444" : "#cbd5e1" }}>🌧 Rain: {hovData.rain}h</span>
-          </div>
+          {tip.avg ? (
+            <>
+              <div style={{ fontWeight: 700, marginBottom: 4, color: tip.avg.frac >= 0.5 ? "#22c55e" : "#ef4444" }}>{tip.avg.label}</div>
+              <div>{tip.avg.yes} of {tip.avg.n} years good ({Math.round(tip.avg.frac * 100)}%)</div>
+            </>
+          ) : (
+            <>
+              <div style={{ fontWeight: 700, marginBottom: 4, color: tip.good ? "#22c55e" : "#ef4444" }}>
+                {tip.date} — {tip.good === null ? "No data" : tip.good ? "Good day" : "Bad day"}
+              </div>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "2px 14px", fontVariantNumeric: "tabular-nums" }}>
+                <span style={{ color: +tip.sun < sliders.minSun ? "#ef4444" : "#cbd5e1" }}>☀ Sun: {tip.sun}h</span>
+                <span style={{ color: +tip.temp > sliders.maxTemp || +tip.temp < sliders.minTemp ? "#ef4444" : "#cbd5e1" }}>🌡 High: {tip.temp}°C</span>
+                <span style={{ color: +tip.day < sliders.minDay ? "#ef4444" : "#cbd5e1" }}>◑ Daylight: {tip.day}h</span>
+                <span style={{ color: +tip.rain > sliders.maxRain ? "#ef4444" : "#cbd5e1" }}>🌧 Rain: {tip.rain}h</span>
+              </div>
+            </>
+          )}
         </div>
       )}
     </div>
@@ -198,12 +246,12 @@ function DotStrip({ data, sliders }) {
 }
 
 function MonthlyBars({ monthly }) {
-  const entries = Object.entries(monthly).sort(([a], [b]) => a.localeCompare(b));
+  const entries = Object.entries(monthly).sort(([a], [b]) => a - b);
   return (
     <div style={{ display: "flex", gap: 3, marginTop: 10, alignItems: "end", height: 40 }}>
       {entries.map(([m, { g, t }]) => {
         const pct = t > 0 ? (g / t) * 100 : 0;
-        const label = MO[parseInt(m.slice(5, 7)) - 1];
+        const label = MO[m];
         return (
           <div key={m} style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", gap: 2 }}>
             <div style={{ fontSize: 8, color: "#64748b", fontVariantNumeric: "tabular-nums" }}>
@@ -221,6 +269,36 @@ function MonthlyBars({ monthly }) {
           </div>
         );
       })}
+    </div>
+  );
+}
+
+function MonthRange({ value: [lo, hi], onChange }) {
+  const pct = m => (m / 11) * 100;
+  return (
+    <div style={{ flex: "1 1 320px" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 5, alignItems: "baseline" }}>
+        <span style={{ fontSize: 11, color: "#8892a4", letterSpacing: "0.02em", fontWeight: 500 }}>Months</span>
+        <span style={{ fontSize: 13, fontWeight: 700, color: "#22c55e" }}>
+          {lo === hi ? MONTH_NAMES[lo] : `${MONTH_NAMES[lo]} – ${MONTH_NAMES[hi]}`}
+        </span>
+      </div>
+      <div style={{ position: "relative", height: 20, display: "flex", alignItems: "center" }}>
+        <div style={{ position: "absolute", left: 0, right: 0, height: 4, borderRadius: 2, background: "#1a2236" }} />
+        <div style={{ position: "absolute", left: `${pct(lo)}%`, width: `${pct(hi) - pct(lo)}%`, height: 4, borderRadius: 2, background: "#22c55e55" }} />
+        {[0, 1].map(k => (
+          <input key={k} type="range" className="dual" min={0} max={11} step={1} value={k ? hi : lo}
+            onChange={e => { const v = +e.target.value; onChange(k ? [lo, Math.max(v, lo)] : [Math.min(v, hi), hi]); }}
+            style={{
+              position: "absolute", left: 0, right: 0, width: "100%",
+              appearance: "none", WebkitAppearance: "none", background: "transparent",
+              height: 20, margin: 0, outline: "none", pointerEvents: "none",
+            }} />
+        ))}
+      </div>
+      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 9, color: "#475569", marginTop: 2 }}>
+        {MO.map(m => <span key={m}>{m}</span>)}
+      </div>
     </div>
   );
 }
@@ -247,7 +325,11 @@ export default function DayQualityTracker() {
   const [results, setResults] = useState([]);
   const [showDropdown, setShowDropdown] = useState(false);
   const timer = useRef();
+  const [months, setMonths] = useState([0, 11]);
+  const [years, setYears] = useState([CUR_YEAR]);
+  const [showAvg, setShowAvg] = useState(false);
   const range = useMemo(() => getRange(), []);
+  const toggleYear = y => setYears(p => p.includes(y) ? p.filter(v => v !== y) : [...p, y]);
 
   const load = useCallback(async (city) => {
     const k = ckey(city);
@@ -310,6 +392,8 @@ export default function DayQualityTracker() {
         }
         input[type=range]::-webkit-slider-runnable-track { height: 4px; background: transparent; }
         input[type=range]::-moz-range-track { height: 4px; background: transparent; }
+        input.dual::-webkit-slider-thumb { pointer-events: auto; }
+        input.dual::-moz-range-thumb { pointer-events: auto; }
         .city-card { transition: box-shadow 0.2s; }
         .city-card:hover { box-shadow: 0 0 0 1px #334155, 0 8px 32px rgba(0,0,0,0.3); }
         ::selection { background: #22c55e44; }
@@ -328,7 +412,7 @@ export default function DayQualityTracker() {
             Bad Weather Tracker
           </h1>
           <p style={{ fontSize: 13, color: "#64748b", margin: "6px 0 0", lineHeight: 1.5 }}>
-            How many <span style={{ color: "#22c55e", fontWeight: 600 }}>good</span> vs <span style={{ color: "#ef4444", fontWeight: 600 }}>bad</span> weather days did your city have in the last year? Search for a location, adjust the thresholds, and compare cities side by side.
+            How many <span style={{ color: "#22c55e", fontWeight: 600 }}>good</span> vs <span style={{ color: "#ef4444", fontWeight: 600 }}>bad</span> weather days did your city have? Search for a location, adjust the thresholds, pick months and years, and compare cities side by side.
           </p>
         </div>
 
@@ -360,6 +444,27 @@ export default function DayQualityTracker() {
                 </button>
               );
             })}
+          </div>
+        </div>
+
+        {/* Months + years panel */}
+        <div style={{
+          background: "#131b2e", borderRadius: 14, padding: "18px 20px 14px",
+          marginBottom: 14, border: "1px solid #1e293b",
+        }}>
+          <MonthRange value={months} onChange={setMonths} />
+          <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: "8px 16px", marginTop: 14 }}>
+            <span style={{ fontSize: 11, color: "#8892a4", fontWeight: 500 }}>Years</span>
+            {YEARS.map(y => (
+              <label key={y} style={{ display: "inline-flex", alignItems: "center", gap: 5, fontSize: 12, color: "#cbd5e1", cursor: "pointer" }}>
+                <input type="checkbox" checked={years.includes(y)} onChange={() => toggleYear(y)} style={{ accentColor: "#22c55e" }} />
+                {y}
+              </label>
+            ))}
+            <label style={{ display: "inline-flex", alignItems: "center", gap: 5, fontSize: 12, color: "#cbd5e1", cursor: "pointer" }}>
+              <input type="checkbox" checked={showAvg} onChange={() => setShowAvg(v => !v)} style={{ accentColor: "#22c55e" }} />
+              Average ({YEARS[YEARS.length - 1]}–{CUR_YEAR})
+            </label>
           </div>
         </div>
 
@@ -413,7 +518,29 @@ export default function DayQualityTracker() {
           const k = ckey(city);
           const d = weatherData[k];
           const ls = loadState[k];
-          const stats = d?.time ? getStats(d, sl) : null;
+          let stats = null, rows = [];
+          if (d?.time) {
+            const [m0, m1] = months;
+            const sel = [...years].sort((a, b) => b - a);
+            const groups = sel.map(y => yearIndices(d, y, m0, m1));
+            rows = sel.map((y, k) => ({
+              label: String(y),
+              cells: groups[k].map(i => ({ i, slot: slotOf(d.time[i], m0), g: classify(d, i, sl) })),
+            }));
+            if (showAvg) {
+              const acc = new Map();
+              for (const y of YEARS) for (const i of yearIndices(d, y, m0, m1)) {
+                const g = classify(d, i, sl);
+                if (g === null) continue;
+                const slot = slotOf(d.time[i], m0);
+                const a = acc.get(slot) ?? { slot, yes: 0, n: 0, label: d.time[i].slice(5) };
+                a.n++; if (g) a.yes++;
+                acc.set(slot, a);
+              }
+              rows.push({ label: "Avg", avg: true, cells: [...acc.values()].map(a => ({ ...a, frac: a.yes / a.n })) });
+            }
+            if (groups.length) stats = getStats(d, sl, groups);
+          }
 
           return (
             <div key={k} className="city-card" style={{
@@ -446,7 +573,7 @@ export default function DayQualityTracker() {
 
               {ls === "loading" && (
                 <div style={{ color: "#475569", fontSize: 13, padding: "20px 0" }}>
-                  <span style={{ display: "inline-block", animation: "pulse 1.5s infinite" }}>Fetching 365 days of weather data...</span>
+                  <span style={{ display: "inline-block", animation: "pulse 1.5s infinite" }}>Fetching 5 years of weather data...</span>
                 </div>
               )}
 
@@ -463,7 +590,9 @@ export default function DayQualityTracker() {
 
               {d?.time && (
                 <>
-                  <DotStrip data={d} sliders={sl} />
+                  {rows.length > 0
+                    ? <Strips data={d} sliders={sl} rows={rows} m0={months[0]} m1={months[1]} />
+                    : <div style={{ color: "#475569", fontSize: 13, padding: "8px 0" }}>Select at least one year or the average.</div>}
 
                   {stats && (
                     <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 12 }}>
