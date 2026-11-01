@@ -66,22 +66,41 @@ function classify(d, i, sl) {
   return sun >= sl.minSun && day >= sl.minDay && temp >= sl.minTemp && temp <= sl.maxTemp && rain <= sl.maxRain;
 }
 
-// groups: arrays of day indices (one per year); streaks do not span groups
+// groups: arrays of day indices (one per year)
+// Colour of a day; a day failing several conditions gets the first of these that applies
+const REASONS = {
+  good: { color: "#22c55e", label: "Good day" },
+  hot: { color: "#ef4444", label: "Bad day — too hot" },
+  cold: { color: "#1d4ed8", label: "Bad day — too cold" },
+  rain: { color: "#14b8a6", label: "Bad day — too much rain" },
+  sun: { color: "#f4511e", label: "Bad day — too little sun" },
+  daylight: { color: "#94a3b8", label: "Bad day — too little daylight" },
+};
+
+function dayReason(d, i, sl) {
+  const temp = d.temperature_2m_max?.[i];
+  if (temp == null) return null;
+  if (temp > sl.maxTemp) return "hot";
+  if (temp < sl.minTemp) return "cold";
+  if ((d.precipitation_hours?.[i] ?? 0) > sl.maxRain) return "rain";
+  if ((d.sunshine_duration?.[i] ?? 0) / 3600 < sl.minSun) return "sun";
+  if ((d.daylight_duration?.[i] ?? 0) / 3600 < sl.minDay) return "daylight";
+  return "good";
+}
+
 function getStats(d, sl, groups) {
-  let good = 0, total = 0, bs = 0, mbs = 0, gs = 0, mgs = 0;
+  let good = 0, total = 0;
   let failSun = 0, failDay = 0, failMinTemp = 0, failMaxTemp = 0, failRain = 0;
   const mo = {};
   for (const idx of groups) {
-    bs = 0; gs = 0;
     for (const i of idx) {
       total++;
       const g = classify(d, i, sl);
       const m = +d.time[i].slice(5, 7) - 1;
       if (!mo[m]) mo[m] = { g: 0, t: 0 };
       mo[m].t++;
-      if (g) { good++; mo[m].g++; gs++; mgs = Math.max(mgs, gs); bs = 0; }
+      if (g) { good++; mo[m].g++; }
       else {
-        bs++; mbs = Math.max(mbs, bs); gs = 0;
         const sun = (d.sunshine_duration?.[i] ?? 0) / 3600;
         const day = (d.daylight_duration?.[i] ?? 0) / 3600;
         const temp = d.temperature_2m_max?.[i];
@@ -94,8 +113,37 @@ function getStats(d, sl, groups) {
       }
     }
   }
-  return { good, total, maxBad: mbs, maxGood: mgs, monthly: mo,
+  return { good, total, monthly: mo,
     failSun, failDay, failMinTemp, failMaxTemp, failRain };
+}
+
+const median = a => {
+  const v = a.filter(x => x != null).sort((x, y) => x - y);
+  if (!v.length) return null;
+  const h = v.length >> 1;
+  return v.length % 2 ? v[h] : (v[h - 1] + v[h]) / 2;
+};
+
+// One synthetic day per calendar slot whose metrics are the medians across the given years' days
+function medianCells(d, sl, groups, m0) {
+  const bySlot = new Map();
+  for (const idx of groups) for (const i of idx) {
+    const slot = slotOf(d.time[i], m0);
+    if (!bySlot.has(slot)) bySlot.set(slot, { date: d.time[i].slice(5), is: [] });
+    bySlot.get(slot).is.push(i);
+  }
+  return [...bySlot].map(([slot, { date, is }]) => {
+    const col = k => median(is.map(i => d[k]?.[i]));
+    const m = {
+      sunshine_duration: [col("sunshine_duration")], daylight_duration: [col("daylight_duration")],
+      temperature_2m_max: [col("temperature_2m_max")], precipitation_hours: [col("precipitation_hours")],
+    };
+    return {
+      slot, date, n: is.length, g: classify(m, 0, sl), why: dayReason(m, 0, sl),
+      sun: (m.sunshine_duration[0] ?? 0) / 3600, day: (m.daylight_duration[0] ?? 0) / 3600,
+      temp: m.temperature_2m_max[0] ?? 0, rain: m.precipitation_hours[0] ?? 0,
+    };
+  });
 }
 
 function yearIndices(d, year, m0, m1) {
@@ -143,7 +191,7 @@ const ROW_H = 18;
 const ROW_GAP = 4;
 const LABEL_W = 44;
 
-// rows: [{ label, cells: [{ slot, i?, g, frac?, yes?, n? }], avg? }]
+// rows: [{ label, cells: [{ slot, g, why, i? | date, sun, day, temp, rain, n }] }]; median cells carry their own values
 function Strips({ data, sliders, rows, m0, m1 }) {
   const [hov, setHov] = useState(null); // { row, cell }
   const n = CUM[m1] + DIM[m1] - CUM[m0];
@@ -152,19 +200,17 @@ function Strips({ data, sliders, rows, m0, m1 }) {
 
   let tip = null;
   if (hov) {
-    const row = rows[hov.row], c = hov.cell;
-    if (row.avg) {
-      tip = { avg: c };
-    } else {
-      tip = {
+    const c = hov.cell;
+    tip = c.i === undefined
+      ? { date: c.date, sun: c.sun.toFixed(1), day: c.day.toFixed(1), temp: c.temp.toFixed(1), rain: c.rain.toFixed(1), good: c.g, why: c.why, n: c.n }
+      : {
         date: data.time[c.i],
         sun: ((data.sunshine_duration?.[c.i] ?? 0) / 3600).toFixed(1),
         day: ((data.daylight_duration?.[c.i] ?? 0) / 3600).toFixed(1),
         temp: data.temperature_2m_max?.[c.i]?.toFixed(1) ?? "—",
         rain: (data.precipitation_hours?.[c.i] ?? 0).toFixed(1),
-        good: c.g,
+        good: c.g, why: c.why,
       };
-    }
   }
 
   return (
@@ -180,18 +226,9 @@ function Strips({ data, sliders, rows, m0, m1 }) {
                   const isHov = hov?.row === ri && hov.cell === c;
                   return (
                     <g key={c.slot}>
-                      {row.avg ? (
-                        <rect x={x} y={0} width={bw} height={ROW_H} rx={0.4}
-                          fill="#22c55e" fillOpacity={0.12 + 0.88 * c.frac}
-                          stroke="#ef4444" strokeWidth={0.35} strokeOpacity={(1 - c.frac) * 0.6}
-                          opacity={isHov ? 1 : 0.85} />
-                      ) : (
-                        <rect x={x} y={0} width={bw} height={ROW_H} rx={0.4}
-                          fill={c.g === null ? "#334155" : c.g ? "#22c55e" : "none"}
-                          stroke={c.g === null ? "none" : c.g ? (isHov ? "#86efac" : "#22c55e") : "#ef4444"}
-                          strokeWidth={c.g ? 0 : 0.35}
-                          opacity={c.g === null ? 0.3 : c.g ? (isHov ? 1 : 0.85) : (isHov ? 0.9 : 0.5)} />
-                      )}
+                      <rect x={x} y={0} width={bw} height={ROW_H} rx={0.4}
+                        fill={c.why ? REASONS[c.why].color : "#334155"}
+                        opacity={c.why ? (isHov ? 1 : 0.85) : 0.3} />
                       <rect x={x} y={0} width={bw} height={ROW_H} fill="transparent"
                         onMouseEnter={() => setHov({ row: ri, cell: c })}
                         onMouseLeave={() => setHov(null)}
@@ -221,24 +258,16 @@ function Strips({ data, sliders, rows, m0, m1 }) {
           pointerEvents: "none", zIndex: 20, whiteSpace: "nowrap",
           boxShadow: "0 8px 24px rgba(0,0,0,0.5)",
         }}>
-          {tip.avg ? (
-            <>
-              <div style={{ fontWeight: 700, marginBottom: 4, color: tip.avg.frac >= 0.5 ? "#22c55e" : "#ef4444" }}>{tip.avg.label}</div>
-              <div>{tip.avg.yes} of {tip.avg.n} years good ({Math.round(tip.avg.frac * 100)}%)</div>
-            </>
-          ) : (
-            <>
-              <div style={{ fontWeight: 700, marginBottom: 4, color: tip.good ? "#22c55e" : "#ef4444" }}>
-                {tip.date} — {tip.good === null ? "No data" : tip.good ? "Good day" : "Bad day"}
-              </div>
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "2px 14px", fontVariantNumeric: "tabular-nums" }}>
-                <span style={{ color: +tip.sun < sliders.minSun ? "#ef4444" : "#cbd5e1" }}>☀ Sun: {tip.sun}h</span>
-                <span style={{ color: +tip.temp > sliders.maxTemp || +tip.temp < sliders.minTemp ? "#ef4444" : "#cbd5e1" }}>🌡 High: {tip.temp}°C</span>
-                <span style={{ color: +tip.day < sliders.minDay ? "#ef4444" : "#cbd5e1" }}>◑ Daylight: {tip.day}h</span>
-                <span style={{ color: +tip.rain > sliders.maxRain ? "#ef4444" : "#cbd5e1" }}>🌧 Rain: {tip.rain}h</span>
-              </div>
-            </>
-          )}
+          <div style={{ fontWeight: 700, marginBottom: 4, color: tip.why ? REASONS[tip.why].color : "#94a3b8" }}>
+            {tip.date} — {tip.why ? REASONS[tip.why].label : "No data"}
+          </div>
+          {tip.n && <div style={{ marginBottom: 4, color: "#64748b" }}>median of {tip.n} year{tip.n > 1 ? "s" : ""}</div>}
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "2px 14px", fontVariantNumeric: "tabular-nums" }}>
+            <span style={{ color: +tip.sun < sliders.minSun ? "#ef4444" : "#cbd5e1" }}>☀ Sun: {tip.sun}h</span>
+            <span style={{ color: +tip.temp > sliders.maxTemp || +tip.temp < sliders.minTemp ? "#ef4444" : "#cbd5e1" }}>🌡 High: {tip.temp}°C</span>
+            <span style={{ color: +tip.day < sliders.minDay ? "#ef4444" : "#cbd5e1" }}>◑ Daylight: {tip.day}h</span>
+            <span style={{ color: +tip.rain > sliders.maxRain ? "#ef4444" : "#cbd5e1" }}>🌧 Rain: {tip.rain}h</span>
+          </div>
         </div>
       )}
     </div>
@@ -327,7 +356,7 @@ export default function DayQualityTracker() {
   const timer = useRef();
   const [months, setMonths] = useState([0, 11]);
   const [years, setYears] = useState([CUR_YEAR]);
-  const [showAvg, setShowAvg] = useState(false);
+  const [showMedian, setShowMedian] = useState(false);
   const range = useMemo(() => getRange(), []);
   const toggleYear = y => setYears(p => p.includes(y) ? p.filter(v => v !== y) : [...p, y]);
 
@@ -462,8 +491,8 @@ export default function DayQualityTracker() {
               </label>
             ))}
             <label style={{ display: "inline-flex", alignItems: "center", gap: 5, fontSize: 12, color: "#cbd5e1", cursor: "pointer" }}>
-              <input type="checkbox" checked={showAvg} onChange={() => setShowAvg(v => !v)} style={{ accentColor: "#22c55e" }} />
-              Average ({YEARS[YEARS.length - 1]}–{CUR_YEAR})
+              <input type="checkbox" checked={showMedian} onChange={() => setShowMedian(v => !v)} style={{ accentColor: "#22c55e" }} />
+              Median of selected years
             </label>
           </div>
         </div>
@@ -525,20 +554,9 @@ export default function DayQualityTracker() {
             const groups = sel.map(y => yearIndices(d, y, m0, m1));
             rows = sel.map((y, k) => ({
               label: String(y),
-              cells: groups[k].map(i => ({ i, slot: slotOf(d.time[i], m0), g: classify(d, i, sl) })),
+              cells: groups[k].map(i => ({ i, slot: slotOf(d.time[i], m0), g: classify(d, i, sl), why: dayReason(d, i, sl) })),
             }));
-            if (showAvg) {
-              const acc = new Map();
-              for (const y of YEARS) for (const i of yearIndices(d, y, m0, m1)) {
-                const g = classify(d, i, sl);
-                if (g === null) continue;
-                const slot = slotOf(d.time[i], m0);
-                const a = acc.get(slot) ?? { slot, yes: 0, n: 0, label: d.time[i].slice(5) };
-                a.n++; if (g) a.yes++;
-                acc.set(slot, a);
-              }
-              rows.push({ label: "Avg", avg: true, cells: [...acc.values()].map(a => ({ ...a, frac: a.yes / a.n })) });
-            }
+            if (showMedian && groups.length) rows.push({ label: "Median", cells: medianCells(d, sl, groups, m0) });
             if (groups.length) stats = getStats(d, sl, groups);
           }
 
@@ -592,14 +610,12 @@ export default function DayQualityTracker() {
                 <>
                   {rows.length > 0
                     ? <Strips data={d} sliders={sl} rows={rows} m0={months[0]} m1={months[1]} />
-                    : <div style={{ color: "#475569", fontSize: 13, padding: "8px 0" }}>Select at least one year or the average.</div>}
+                    : <div style={{ color: "#475569", fontSize: 13, padding: "8px 0" }}>Select at least one year.</div>}
 
                   {stats && (
                     <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 12 }}>
                       <StatPill label="Good days" value={stats.good} color="#22c55e" />
                       <StatPill label="Bad days" value={stats.total - stats.good} color="#ef4444" />
-                      <StatPill label="Worst streak" value={`${stats.maxBad}d`} color="#ef4444" />
-                      <StatPill label="Best streak" value={`${stats.maxGood}d`} color="#22c55e" />
                     </div>
                   )}
 
@@ -610,11 +626,11 @@ export default function DayQualityTracker() {
                       </div>
                       <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
                         {[
-                          { label: "Low sunshine", count: stats.failSun, color: "#facc15" },
-                          { label: "Short daylight", count: stats.failDay, color: "#38bdf8" },
-                          { label: "Too cold", count: stats.failMinTemp, color: "#f87171" },
-                          { label: "Too hot", count: stats.failMaxTemp, color: "#fb923c" },
-                          { label: "Too much rain", count: stats.failRain, color: "#818cf8" },
+                          { label: "Low sunshine", count: stats.failSun, color: REASONS.sun.color },
+                          { label: "Short daylight", count: stats.failDay, color: REASONS.daylight.color },
+                          { label: "Too cold", count: stats.failMinTemp, color: REASONS.cold.color },
+                          { label: "Too hot", count: stats.failMaxTemp, color: REASONS.hot.color },
+                          { label: "Too much rain", count: stats.failRain, color: REASONS.rain.color },
                         ].filter(r => r.count > 0)
                          .sort((a, b) => b.count - a.count)
                          .map(r => (
@@ -646,13 +662,12 @@ export default function DayQualityTracker() {
           display: "flex", justifyContent: "space-between", alignItems: "center",
           marginTop: 8, padding: "0 4px", flexWrap: "wrap", gap: 8,
         }}>
-          <div style={{ display: "flex", gap: 14, fontSize: 11, color: "#475569" }}>
-            <span style={{ display: "flex", alignItems: "center", gap: 4 }}>
-              <span style={{ width: 10, height: 10, borderRadius: 2, background: "#22c55e", display: "inline-block" }} /> Good
-            </span>
-            <span style={{ display: "flex", alignItems: "center", gap: 4 }}>
-              <span style={{ width: 10, height: 10, borderRadius: 2, border: "1px solid #ef4444", display: "inline-block" }} /> Bad
-            </span>
+          <div style={{ display: "flex", gap: 14, fontSize: 11, color: "#475569", flexWrap: "wrap" }}>
+            {[["good", "Good"], ["hot", "Too hot"], ["cold", "Too cold"], ["rain", "Rain"], ["sun", "Low sun"], ["daylight", "Short daylight"]].map(([k, l]) => (
+              <span key={k} style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                <span style={{ width: 10, height: 10, borderRadius: 2, background: REASONS[k].color, display: "inline-block" }} /> {l}
+              </span>
+            ))}
           </div>
           <div style={{ fontSize: 10, color: "#334155" }}>
             Data: Open-Meteo.com · ERA5 reanalysis · last ~2 days may lag
