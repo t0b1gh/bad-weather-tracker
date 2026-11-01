@@ -71,10 +71,10 @@ function classify(d, i, sl) {
 const REASONS = {
   good: { color: "#22c55e", label: "Good day" },
   hot: { color: "#ef4444", label: "Bad day — too hot" },
-  cold: { color: "#1d4ed8", label: "Bad day — too cold" },
-  rain: { color: "#14b8a6", label: "Bad day — too much rain" },
-  sun: { color: "#f4511e", label: "Bad day — too little sun" },
-  daylight: { color: "#94a3b8", label: "Bad day — too little daylight" },
+  cold: { color: "#3b82f6", label: "Bad day — too cold" },
+  rain: { color: "#22d3ee", label: "Bad day — too much rain" },
+  sun: { color: "#f59e0b", label: "Bad day — too little sun" },
+  daylight: { color: "#a78bfa", label: "Bad day — too little daylight" },
 };
 
 function dayReason(d, i, sl) {
@@ -349,14 +349,14 @@ export default function DayQualityTracker() {
   const [cities, setCities] = useState([]);
   const [weatherData, setWeatherData] = useState({});
   const [loadState, setLoadState] = useState({});
-  const [sl, setSl] = useState({ minSun: 3, minDay: 9, minTemp: 10, maxTemp: 50, maxRain: 2 });
+  const [sl, setSl] = useState({ minSun: 5, minDay: 7, minTemp: 18, maxTemp: 50, maxRain: 2 });
   const [query, setQuery] = useState("");
   const [results, setResults] = useState([]);
   const [showDropdown, setShowDropdown] = useState(false);
   const timer = useRef();
   const [months, setMonths] = useState([0, 11]);
-  const [years, setYears] = useState([CUR_YEAR]);
-  const [showMedian, setShowMedian] = useState(false);
+  const [years, setYears] = useState(YEARS.filter(y => y !== CUR_YEAR));
+  const [showMedian, setShowMedian] = useState(true);
   const range = useMemo(() => getRange(), []);
   const toggleYear = y => setYears(p => p.includes(y) ? p.filter(v => v !== y) : [...p, y]);
 
